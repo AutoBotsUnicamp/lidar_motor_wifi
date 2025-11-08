@@ -48,7 +48,7 @@ static int g_client_socket = -1;
 // --- Pinos do Motor ---
 #define MOTOR_L_FWD_PIN     (GPIO_NUM_25) // Motor Esquerdo - Frente
 #define MOTOR_L_REV_PIN     (GPIO_NUM_26) // Motor Esquerdo - Ré
-#define MOTOR_R_FWD_PIN     (GPIO_NUM_27) // Motor Direito - Frente
+#define MOTOR_R_FWD_PIN     (GPIO_NUM_32) // Motor Direito - Frente
 #define MOTOR_R_REV_PIN     (GPIO_NUM_33) // Motor Direito - Ré
 
 // --- Configuração do LEDC (PWM) ---
