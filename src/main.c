@@ -11,6 +11,7 @@
 #include <lwip/netdb.h>
 #include "driver/uart.h"
 #include "string.h"
+#include "driver/pcnt.h"
 #include "driver/gpio.h"
 #include "esp_netif.h"
 #include "driver/ledc.h"
@@ -38,18 +39,38 @@ WIFI_PASS = sua_senha_aqui (SEM ASPAS)
 #define RX_BUF_SIZE         1024
 #define UART_BUF_SIZE       (1024 * 2)
 
-static const char *TAG = "lidar_bridge";
-static int g_client_socket = -1;
+// --- Globais para comunicação ---
+static const char *TAG = "robot_bridge"; // Mudei o TAG para algo mais genérico
+static int g_client_socket = -1; // Socket do Lidar
+
+// --- Configuração do Encoder (PCNT) ---
+#define ENCODER_L_A_PIN     (GPIO_NUM_27)
+#define ENCODER_L_B_PIN     (GPIO_NUM_23)
+#define ENCODER_R_A_PIN     (GPIO_NUM_14)
+#define ENCODER_R_B_PIN     (GPIO_NUM_13)
+#define PCNT_UNIT_L         PCNT_UNIT_0
+#define PCNT_UNIT_R         PCNT_UNIT_1
+#define PCNT_H_LIM          (32767)  // Limite máximo da contagem
+#define PCNT_L_LIM          (-32768) // Limite mínimo da contagem
+
+// --- Configuração da Odometria (UDP) ---
+#define ODOM_UDP_PORT       8890 // Porta para enviar dados de odometria
+#define ODOM_SEND_PERIOD_MS 20   // Envia dados a cada 20ms (50Hz)
+
+// IP do cliente ROS (pego da conexão TCP do motor)
+static struct sockaddr_in g_ros_client_addr;
+static bool g_ros_client_connected = false;
+static int g_odom_udp_socket = -1;
 
 // --- Motor Control Config ---
 #define MOTOR_TCP_PORT      8889 // Nova porta para o servidor dos motores
 #define MOTOR_RX_BUF_SIZE   128
 
 // --- Pinos do Motor ---
-#define MOTOR_L_FWD_PIN     (GPIO_NUM_25) // Motor Esquerdo - Frente
-#define MOTOR_L_REV_PIN     (GPIO_NUM_26) // Motor Esquerdo - Ré
-#define MOTOR_R_FWD_PIN     (GPIO_NUM_32) // Motor Direito - Frente
-#define MOTOR_R_REV_PIN     (GPIO_NUM_33) // Motor Direito - Ré
+#define MOTOR_L_FWD_PIN     (GPIO_NUM_33) // Motor Esquerdo - Frente
+#define MOTOR_L_REV_PIN     (GPIO_NUM_32) // Motor Esquerdo - Ré
+#define MOTOR_R_FWD_PIN     (GPIO_NUM_26) // Motor Direito - Frente
+#define MOTOR_R_REV_PIN     (GPIO_NUM_25) // Motor Direito - Ré
 
 // --- Configuração do LEDC (PWM) ---
 #define LEDC_TIMER          LEDC_TIMER_0
@@ -63,6 +84,12 @@ static int g_client_socket = -1;
 #define LEDC_L_REV_CHAN     LEDC_CHANNEL_1
 #define LEDC_R_FWD_CHAN     LEDC_CHANNEL_2
 #define LEDC_R_REV_CHAN     LEDC_CHANNEL_3
+
+// Estrutura simples para enviar os dados do encoder
+typedef struct {
+    int16_t left_ticks;
+    int16_t right_ticks;
+} odom_data_t;
 
 // --- Task 1: WiFi Connection ---
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -170,6 +197,67 @@ static void motor_pwm_init(void) {
         ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel[i]));
     }
     ESP_LOGI(TAG, "Controle de Motor (LEDC/PWM) inicializado.");
+}
+
+/**
+ * @brief Inicializa 2 unidades PCNT para encoders em quadratura
+ */
+static void encoder_pcnt_init(void) {
+    // Configuração do PCNT para o motor Esquerdo (Unidade 0)
+    pcnt_config_t pcnt_config_l = {
+        .pulse_gpio_num = ENCODER_L_A_PIN, // Pino A
+        .ctrl_gpio_num = ENCODER_L_B_PIN,  // Pino B
+        .channel = PCNT_CHANNEL_0,
+        .unit = PCNT_UNIT_L,
+        .pos_mode = PCNT_COUNT_DEC, // Decrementa na borda positiva do pino A
+        .neg_mode = PCNT_COUNT_INC, // Incrementa na borda negativa do pino A
+        .lctrl_mode = PCNT_MODE_REVERSE, // Inverte contagem se o pino B estiver ALTO
+        .hctrl_mode = PCNT_MODE_KEEP,    // Mantém contagem se o pino B estiver BAIXO
+        .counter_h_lim = PCNT_H_LIM,
+        .counter_l_lim = PCNT_L_LIM,
+    };
+    ESP_ERROR_CHECK(pcnt_unit_config(&pcnt_config_l));
+
+    // Configuração de "filtro" (opcional, mas bom para ruído)
+    ESP_ERROR_CHECK(pcnt_set_filter_value(PCNT_UNIT_L, 100));
+    ESP_ERROR_CHECK(pcnt_filter_enable(PCNT_UNIT_L));
+
+    // Pausa, limpa e retoma o contador
+    ESP_ERROR_CHECK(pcnt_counter_pause(PCNT_UNIT_L));
+    ESP_ERROR_CHECK(pcnt_counter_clear(PCNT_UNIT_L));
+    ESP_ERROR_CHECK(pcnt_counter_resume(PCNT_UNIT_L));
+
+    // Configuração do PCNT para o motor Direito (Unidade 1)
+    pcnt_config_t pcnt_config_r = {
+        .pulse_gpio_num = ENCODER_R_A_PIN, // Pino A
+        .ctrl_gpio_num = ENCODER_R_B_PIN,  // Pino B
+        .channel = PCNT_CHANNEL_0,
+        .unit = PCNT_UNIT_R,
+        .pos_mode = PCNT_COUNT_DEC, 
+        .neg_mode = PCNT_COUNT_INC, 
+        .lctrl_mode = PCNT_MODE_REVERSE,
+        .hctrl_mode = PCNT_MODE_KEEP,
+        .counter_h_lim = PCNT_H_LIM,
+        .counter_l_lim = PCNT_L_LIM,
+    };
+    ESP_ERROR_CHECK(pcnt_unit_config(&pcnt_config_r));
+    
+    // Configuração de "filtro"
+    ESP_ERROR_CHECK(pcnt_set_filter_value(PCNT_UNIT_R, 100));
+    ESP_ERROR_CHECK(pcnt_filter_enable(PCNT_UNIT_R));
+
+    // Pausa, limpa e retoma o contador
+    ESP_ERROR_CHECK(pcnt_counter_pause(PCNT_UNIT_R));
+    ESP_ERROR_CHECK(pcnt_counter_clear(PCNT_UNIT_R));
+    ESP_ERROR_CHECK(pcnt_counter_resume(PCNT_UNIT_R));
+
+    // --- Configura Pull-ups ---
+    gpio_set_pull_mode(ENCODER_L_A_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(ENCODER_L_B_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(ENCODER_R_A_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(ENCODER_R_B_PIN, GPIO_PULLUP_ONLY);
+
+    ESP_LOGI(TAG, "Controle de Encoders (PCNT) inicializado.");
 }
 
 /**
@@ -391,6 +479,15 @@ static void motor_tcp_server_task(void *pvParameters) {
             break; 
         }
 
+        // Salva o endereço do cliente para a task de odometria
+        memcpy(&g_ros_client_addr, &source_addr, sizeof(source_addr));
+        g_ros_client_addr.sin_port = htons(ODOM_UDP_PORT); // Define a porta de destino UDP
+        g_ros_client_connected = true;
+
+        inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
+        ESP_LOGI(TAG, "MotorSrv: Client connected from: %s", addr_str);
+        ESP_LOGI(TAG, "MotorSrv: Storing client IP for Odom UDP stream.");
+
         inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
         ESP_LOGI(TAG, "MotorSrv: Client connected from: %s", addr_str);
 
@@ -401,9 +498,11 @@ static void motor_tcp_server_task(void *pvParameters) {
 
             if (len < 0) {
                 ESP_LOGE(TAG, "MotorSrv: recv failed: errno %d", errno);
+                g_ros_client_connected = false; // Cliente desconectou
                 break; // Sai do loop de recebimento
             } else if (len == 0) {
                 ESP_LOGW(TAG, "MotorSrv: Connection closed");
+                g_ros_client_connected = false; // Cliente desconectou
                 break; // Sai do loop de recebimento
             } else {
                 rx_buffer[len] = 0; // Adiciona terminador nulo
@@ -436,7 +535,8 @@ static void motor_tcp_server_task(void *pvParameters) {
 
         // Cliente desconectou
         close(sock);
-        ESP_LOGI(TAG, "MotorSrv: Client disconnected. Stopping motors.");
+        g_ros_client_connected = false; // Garante que o flag esteja falso
+        ESP_LOGI(TAG, "MotorSrv: Client disconnected. Stopping motors and Odom UDP stream.");
         // Para os motores por segurança
         set_motor_speed(0, 0);
         set_motor_speed(1, 0);
@@ -444,6 +544,59 @@ static void motor_tcp_server_task(void *pvParameters) {
 
 CLEAN_UP:
     close(listen_sock);
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief Task que lê os contadores do PCNT e os envia via UDP
+ * para o cliente ROS conectado.
+ */
+static void odom_udp_task(void *pvParameters) {
+    odom_data_t odom_data;
+    int16_t count_l = 0;
+    int16_t count_r = 0;
+    
+    // Configura o socket UDP
+    g_odom_udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (g_odom_udp_socket < 0) {
+        ESP_LOGE(TAG, "OdomUDP: Unable to create socket: errno %d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "OdomUDP: Socket created");
+
+    while (true) {
+        // Aguarda o período de envio
+        vTaskDelay(pdMS_TO_TICKS(ODOM_SEND_PERIOD_MS));
+
+        // Só envia se o cliente ROS estiver conectado (via TCP do motor)
+        if (!g_ros_client_connected) {
+            continue;
+        }
+
+        // Lê e limpa os contadores (para obter o "delta")
+        ESP_ERROR_CHECK(pcnt_get_counter_value(PCNT_UNIT_L, &count_l));
+        ESP_ERROR_CHECK(pcnt_get_counter_value(PCNT_UNIT_R, &count_r));
+
+        //ESP_LOGI(TAG, "Counters (Raw): Left=%d, Right=%d", count_l, count_r);
+
+        ESP_ERROR_CHECK(pcnt_counter_clear(PCNT_UNIT_L));
+        ESP_ERROR_CHECK(pcnt_counter_clear(PCNT_UNIT_R));
+
+        odom_data.left_ticks = count_l;
+        odom_data.right_ticks = count_r; // Invertido se necessário
+
+        // Envia os dados para o IP do cliente ROS, na porta ODOM_UDP_PORT
+        int err = sendto(g_odom_udp_socket, &odom_data, sizeof(odom_data), 0,
+                         (struct sockaddr *)&g_ros_client_addr, sizeof(g_ros_client_addr));
+        
+        if (err < 0) {
+            ESP_LOGE(TAG, "OdomUDP: Error occurred during sending: errno %d", errno);
+        }
+    }
+
+    // Fecha o socket se a task for encerrada
+    close(g_odom_udp_socket);
     vTaskDelete(NULL);
 }
 
@@ -476,6 +629,9 @@ void app_main(void) {
 
     // Initialize Motor PWM Control
     motor_pwm_init();
+    
+    // Initialize Encoder Pulse Counters
+    encoder_pcnt_init();
 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -493,4 +649,5 @@ void app_main(void) {
     xTaskCreate(uart_to_tcp_task, "uart_to_tcp", 2048, NULL, 4, NULL);
     xTaskCreate(tcp_to_uart_task, "tcp_to_uart", 2048, NULL, 4, NULL);
     xTaskCreate(motor_tcp_server_task, "motor_server", 4096, NULL, 5, NULL);
+    xTaskCreate(odom_udp_task, "odom_udp_task", 4096, NULL, 5, NULL);
 }
