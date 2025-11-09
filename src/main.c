@@ -17,6 +17,7 @@
 #include "driver/ledc.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include "driver/i2c.h" 
 
 // --- Your WiFi Details --- 
 // #define YOUR_WIFI_SSID      "olhar logo"
@@ -85,11 +86,129 @@ static int g_odom_udp_socket = -1;
 #define LEDC_R_FWD_CHAN     LEDC_CHANNEL_2
 #define LEDC_R_REV_CHAN     LEDC_CHANNEL_3
 
+// --- Configuração do IMU (MPU-6050) ---  <-- BLOCO NOVO
+#define I2C_MASTER_SCL_PIN  (GPIO_NUM_22)      // Pino SCL do I2C
+#define I2C_MASTER_SDA_PIN  (GPIO_NUM_21)      // Pino SDA do I2C
+#define I2C_MASTER_NUM      I2C_NUM_0          // Porta I2C
+#define I2C_MASTER_FREQ_HZ  (400000)           // Clock I2C (400kHz)
+#define MPU6050_ADDR        (0x68)             // Endereço I2C do MPU-6050
+
+#define MPU6050_PWR_MGMT_1_REG  (0x6B) // Registro de Power Management
+#define MPU6050_ACCEL_XOUT_H_REG (0x3B) // Registro inicial para leitura de dados
+
 // Estrutura simples para enviar os dados do encoder
 typedef struct {
     int16_t left_ticks;
     int16_t right_ticks;
 } odom_data_t;
+
+// Estrutura simples para os dados brutos do IMU
+typedef struct {
+    int16_t accel_x;
+    int16_t accel_y;
+    int16_t accel_z;
+    int16_t gyro_x;
+    int16_t gyro_y;
+    int16_t gyro_z;
+} imu_raw_data_t;
+
+// Estrutura combinada (Odometria + IMU) para o pacote UDP
+typedef struct {
+    int16_t left_ticks;
+    int16_t right_ticks;
+    imu_raw_data_t imu;
+} robot_data_t;
+
+/**
+ * @brief Inicializa o barramento I2C como mestre
+ */
+static void i2c_master_init(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_PIN,
+        .scl_io_num = I2C_MASTER_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0));
+    ESP_LOGI(TAG, "I2C Master inicializado (SDA: %d, SCL: %d)", I2C_MASTER_SDA_PIN, I2C_MASTER_SCL_PIN);
+}
+
+/**
+ * @brief Acorda o MPU-6050 (tira do modo sleep)
+ */
+static esp_err_t mpu6050_init(void) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_PWR_MGMT_1_REG, true); // Registro PWR_MGMT_1
+    i2c_master_write_byte(cmd, 0x00, true); // Escreve 0 para acordar
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "MPU-6050 acordado com sucesso.");
+    } else {
+        ESP_LOGE(TAG, "Falha ao acordar MPU-6050. Verifique a conexão I2C.");
+    }
+    // Nota: Você pode adicionar aqui configurações de range do giroscópio/acelerômetro
+    return ret;
+}
+
+/**
+ * @brief Lê os dados brutos (Accel e Gyro) do MPU-6050
+ *
+ * @param data Ponteiro para a estrutura onde os dados serão armazenados
+ * @return esp_err_t
+ */
+static esp_err_t mpu6050_read_raw_data(imu_raw_data_t *data) {
+    uint8_t buf_rx[14]; // Buffer para ler 14 bytes (Accel_X/Y/Z, Temp, Gyro_X/Y/Z)
+
+    // 1. Aponta para o registro inicial (ACCEL_XOUT_H)
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_ACCEL_XOUT_H_REG, true);
+    i2c_master_stop(cmd);
+    
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MPU-Read: Falha ao posicionar no registro (err: 0x%x)", ret);
+        return ret;
+    }
+
+    // 2. Lê os 14 bytes de dados em sequência
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read(cmd, buf_rx, 14, I2C_MASTER_LAST_NACK); // Lê 14 bytes, NACK no último
+    i2c_master_stop(cmd);
+
+    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+
+    if (ret != ESP_OK) {
+         ESP_LOGE(TAG, "MPU-Read: Falha ao ler dados (err: 0x%x)", ret);
+        return ret;
+    }
+
+    // 3. Converte os bytes (Big-Endian) para int16_t
+    // (Os dados vêm como High-Byte, Low-Byte)
+    data->accel_x = (buf_rx[0] << 8) | buf_rx[1];
+    data->accel_y = (buf_rx[2] << 8) | buf_rx[3];
+    data->accel_z = (buf_rx[4] << 8) | buf_rx[5];
+    // buf_rx[6] e buf_rx[7] são dados de Temperatura (ignorados por enquanto)
+    data->gyro_x = (buf_rx[8] << 8) | buf_rx[9];
+    data->gyro_y = (buf_rx[10] << 8) | buf_rx[11];
+    data->gyro_z = (buf_rx[12] << 8) | buf_rx[13];
+
+    return ESP_OK;
+}
 
 // --- Task 1: WiFi Connection ---
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -548,11 +667,11 @@ CLEAN_UP:
 }
 
 /**
- * @brief Task que lê os contadores do PCNT e os envia via UDP
- * para o cliente ROS conectado.
+ * @brief Task que lê os contadores do PCNT (Odometria) e os dados do IMU (MPU-6050)
+ * e os envia via UDP para o cliente ROS conectado.
  */
 static void odom_udp_task(void *pvParameters) {
-    odom_data_t odom_data;
+    robot_data_t robot_data; // Usa a nova estrutura combinada
     int16_t count_l = 0;
     int16_t count_r = 0;
     
@@ -574,20 +693,25 @@ static void odom_udp_task(void *pvParameters) {
             continue;
         }
 
-        // Lê e limpa os contadores (para obter o "delta")
+        // --- 1. Ler Encoders ---
         ESP_ERROR_CHECK(pcnt_get_counter_value(PCNT_UNIT_L, &count_l));
         ESP_ERROR_CHECK(pcnt_get_counter_value(PCNT_UNIT_R, &count_r));
-
-        //ESP_LOGI(TAG, "Counters (Raw): Left=%d, Right=%d", count_l, count_r);
-
         ESP_ERROR_CHECK(pcnt_counter_clear(PCNT_UNIT_L));
         ESP_ERROR_CHECK(pcnt_counter_clear(PCNT_UNIT_R));
 
-        odom_data.left_ticks = count_l;
-        odom_data.right_ticks = count_r; // Invertido se necessário
+        // Popula os dados de odometria
+        robot_data.left_ticks = count_l;
+        robot_data.right_ticks = count_r; // Invertido se necessário
 
-        // Envia os dados para o IP do cliente ROS, na porta ODOM_UDP_PORT
-        int err = sendto(g_odom_udp_socket, &odom_data, sizeof(odom_data), 0,
+        // --- 2. Ler IMU ---
+        esp_err_t imu_ret = mpu6050_read_raw_data(&robot_data.imu);
+        if (imu_ret != ESP_OK) {
+            ESP_LOGW(TAG, "OdomUDP: Falha ao ler dados do MPU-6050. Enviando pacote sem dados IMU atualizados.");
+            // Os dados IMU antigos (ou lixo inicial) serão enviados, mas o loop continua
+        }
+
+        // --- 3. Enviar Pacote Combinado ---
+        int err = sendto(g_odom_udp_socket, &robot_data, sizeof(robot_data_t), 0,
                          (struct sockaddr *)&g_ros_client_addr, sizeof(g_ros_client_addr));
         
         if (err < 0) {
@@ -611,6 +735,7 @@ void app_main(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
+
     ESP_ERROR_CHECK(uart_driver_install(LIDAR_UART_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(LIDAR_UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(LIDAR_UART_NUM, UART_PIN_NO_CHANGE, LIDAR_TX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
@@ -632,6 +757,9 @@ void app_main(void) {
     
     // Initialize Encoder Pulse Counters
     encoder_pcnt_init();
+
+    i2c_master_init(); // Inicializa I2C
+    mpu6050_init();    // Inicializa MPU-6050
 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
