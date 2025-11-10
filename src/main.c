@@ -17,7 +17,8 @@
 #include "driver/ledc.h"
 #include <stdlib.h>
 #include <stdio.h>
-#include "driver/i2c.h" 
+#include "driver/i2c.h"
+#include "esp_timer.h"
 
 // --- Your WiFi Details --- 
 // #define YOUR_WIFI_SSID      "olhar logo"
@@ -86,7 +87,18 @@ static int g_odom_udp_socket = -1;
 #define LEDC_R_FWD_CHAN     LEDC_CHANNEL_2
 #define LEDC_R_REV_CHAN     LEDC_CHANNEL_3
 
-// --- Configuração do IMU (MPU-6050) ---  <-- BLOCO NOVO
+// --- Lógica de "Motor Travado" (Stuck Motor)
+#define STUCK_DETECT_MIN_PWM 100     // (10%) PWM mínimo para considerar "travado"
+#define STUCK_DETECT_COUNT 5         // (5 * 20ms = 100ms) Tempo travado antes de agir
+#define STUCK_KICK_PWM 1000          // (100%) PWM máximo para o pulso
+#define STUCK_KICK_DURATION_US (50 * 1000) // 50ms (Duração do pulso em microssegundos)
+
+// --- Globais para controle de motor ---
+// Armazena a velocidade comandada atualmente para a lógica de detecção de "travado"
+static volatile int g_current_speed_l = 0;
+static volatile int g_current_speed_r = 0;
+
+// --- Configuração do IMU (MPU-6050) ---
 #define I2C_MASTER_SCL_PIN  (GPIO_NUM_22)      // Pino SCL do I2C
 #define I2C_MASTER_SDA_PIN  (GPIO_NUM_21)      // Pino SDA do I2C
 #define I2C_MASTER_NUM      I2C_NUM_0          // Porta I2C
@@ -95,12 +107,6 @@ static int g_odom_udp_socket = -1;
 
 #define MPU6050_PWR_MGMT_1_REG  (0x6B) // Registro de Power Management
 #define MPU6050_ACCEL_XOUT_H_REG (0x3B) // Registro inicial para leitura de dados
-
-// Estrutura simples para enviar os dados do encoder
-typedef struct {
-    int16_t left_ticks;
-    int16_t right_ticks;
-} odom_data_t;
 
 // Estrutura simples para os dados brutos do IMU
 typedef struct {
@@ -607,9 +613,6 @@ static void motor_tcp_server_task(void *pvParameters) {
         ESP_LOGI(TAG, "MotorSrv: Client connected from: %s", addr_str);
         ESP_LOGI(TAG, "MotorSrv: Storing client IP for Odom UDP stream.");
 
-        inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
-        ESP_LOGI(TAG, "MotorSrv: Client connected from: %s", addr_str);
-
         // --- Loop de Recebimento de Comandos ---
         char rx_buffer[MOTOR_RX_BUF_SIZE];
         while (true) {
@@ -642,6 +645,11 @@ static void motor_tcp_server_task(void *pvParameters) {
 
                     ESP_LOGI(TAG, "MotorCmd: L:%d, A:%d -> Left:%d, Right:%d", linear_cmd, angular_cmd, left_speed, right_speed);
 
+                    // Salva a velocidade comandada nas globais ANTES de definir a velocidade
+                    // para a lógica de "motor travado" poder acessá-las
+                    g_current_speed_l = left_speed;
+                    g_current_speed_r = right_speed;
+
                     // Define a velocidade dos motores
                     set_motor_speed(0, left_speed); // Motor 0 = Esquerdo
                     set_motor_speed(1, right_speed); // Motor 1 = Direito
@@ -656,9 +664,14 @@ static void motor_tcp_server_task(void *pvParameters) {
         close(sock);
         g_ros_client_connected = false; // Garante que o flag esteja falso
         ESP_LOGI(TAG, "MotorSrv: Client disconnected. Stopping motors and Odom UDP stream.");
+        
         // Para os motores por segurança
         set_motor_speed(0, 0);
         set_motor_speed(1, 0);
+        
+        // Reseta as velocidades comandadas globais
+        g_current_speed_l = 0;
+        g_current_speed_r = 0;
     }
 
 CLEAN_UP:
@@ -669,12 +682,24 @@ CLEAN_UP:
 /**
  * @brief Task que lê os contadores do PCNT (Odometria) e os dados do IMU (MPU-6050)
  * e os envia via UDP para o cliente ROS conectado.
+ * Inlui a lógica de detecção de motor travado (stuck motor) e aplica pulso se necessário.
  */
 static void odom_udp_task(void *pvParameters) {
     robot_data_t robot_data; // Usa a nova estrutura combinada
     int16_t count_l = 0;
     int16_t count_r = 0;
     
+    // Variáveis estáticas para contagem de "travado"
+    static int stuck_counter_l = 0;
+    static int stuck_counter_r = 0;
+    
+    // Variáveis estáticas para a máquina de estados do "kickstart" (não-bloqueante)
+    typedef enum { STATE_IDLE, STATE_KICKING } motor_kick_state_t;
+    static motor_kick_state_t motor_state_l = STATE_IDLE;
+    static motor_kick_state_t motor_state_r = STATE_IDLE;
+    static int64_t kick_start_time_l = 0;
+    static int64_t kick_start_time_r = 0;
+
     // Configura o socket UDP
     g_odom_udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (g_odom_udp_socket < 0) {
@@ -688,8 +713,13 @@ static void odom_udp_task(void *pvParameters) {
         // Aguarda o período de envio
         vTaskDelay(pdMS_TO_TICKS(ODOM_SEND_PERIOD_MS));
 
-        // Só envia se o cliente ROS estiver conectado (via TCP do motor)
+        // Só continua se o cliente ROS estiver conectado
         if (!g_ros_client_connected) {
+            // Garante que os contadores de "travado" sejam resetados se o cliente desconectar
+            stuck_counter_l = 0;
+            stuck_counter_r = 0;
+            motor_state_l = STATE_IDLE;
+            motor_state_r = STATE_IDLE;
             continue;
         }
 
@@ -699,18 +729,91 @@ static void odom_udp_task(void *pvParameters) {
         ESP_ERROR_CHECK(pcnt_counter_clear(PCNT_UNIT_L));
         ESP_ERROR_CHECK(pcnt_counter_clear(PCNT_UNIT_R));
 
-        // Popula os dados de odometria
-        robot_data.left_ticks = count_l;
-        robot_data.right_ticks = count_r; // Invertido se necessário
+        // --- 2. Lógica de Detecção de Motor Travado (Não-Bloqueante) ---
+        int64_t now_us = esp_timer_get_time(); // Pega o tempo atual em microssegundos
 
-        // --- 2. Ler IMU ---
+        // --- Lógica do Motor Esquerdo ---
+        switch (motor_state_l) {
+            case STATE_IDLE:
+                // Estamos no modo normal, checar se travou
+                // Condição: Comando é alto (frente OU ré) E não há movimento (ticks == 0)
+                if ((abs(g_current_speed_l) > STUCK_DETECT_MIN_PWM) && (count_l == 0)) {
+                    stuck_counter_l++; // Incrementa o contador de "travado"
+                } else {
+                    stuck_counter_l = 0; // Reset se estiver movendo ou o comando for baixo
+                }
+
+                // Se o motor estiver travado por tempo suficiente
+                if (stuck_counter_l > STUCK_DETECT_COUNT) {
+                    ESP_LOGW(TAG, "Motor Esquerdo TRAVADO! Iniciando pulso...");
+                    motor_state_l = STATE_KICKING;
+                    kick_start_time_l = now_us;
+                    
+                    int kick_direction = (g_current_speed_l > 0) ? 1 : -1; // Pega a direção
+                    set_motor_speed(0, STUCK_KICK_PWM * kick_direction); // Aplica pulso máximo
+                    
+                    stuck_counter_l = 0; // Reseta o contador
+                }
+                break; // Fim do caso IDLE
+
+            case STATE_KICKING:
+                // Estamos aplicando o pulso, checar se o tempo (em microssegundos) acabou
+                if (now_us - kick_start_time_l > STUCK_KICK_DURATION_US) {
+                    ESP_LOGI(TAG, "Motor Esquerdo: Pulso finalizado. Retornando ao normal.");
+                    set_motor_speed(0, g_current_speed_l); // Restaura velocidade original comandada
+                    motor_state_l = STATE_IDLE; // Retorna ao estado normal
+                }
+                // Se o tempo não acabou, não faz nada (deixa o pulso continuar)
+                break; // Fim do caso KICKING
+        }
+
+        // --- Lógica do Motor Direito ---
+        switch (motor_state_r) {
+            case STATE_IDLE:
+                // Checar se travou
+                if ((abs(g_current_speed_r) > STUCK_DETECT_MIN_PWM) && (count_r == 0)) {
+                    stuck_counter_r++;
+                } else {
+                    stuck_counter_r = 0;
+                }
+
+                // Se travado por tempo suficiente
+                if (stuck_counter_r > STUCK_DETECT_COUNT) {
+                    ESP_LOGW(TAG, "Motor Direito TRAVADO! Iniciando pulso...");
+                    motor_state_r = STATE_KICKING;
+                    kick_start_time_r = now_us;
+                    
+                    int kick_direction = (g_current_speed_r > 0) ? 1 : -1;
+                    set_motor_speed(1, STUCK_KICK_PWM * kick_direction);
+                    
+                    stuck_counter_r = 0;
+                }
+                break; // Fim do caso IDLE
+
+            case STATE_KICKING:
+                // Checar se o pulso terminou
+                if (now_us - kick_start_time_r > STUCK_KICK_DURATION_US) {
+                    ESP_LOGI(TAG, "Motor Direito: Pulso finalizado. Retornando ao normal.");
+                    set_motor_speed(1, g_current_speed_r); // Restaura velocidade
+                    motor_state_r = STATE_IDLE;
+                }
+                break; // Fim do caso KICKING
+        }
+        // --- Fim da Lógica de Motor Travado ---
+
+
+        // --- 3. Popula os dados de odometria ---
+        robot_data.left_ticks = count_l;
+        robot_data.right_ticks = count_r;
+
+        // --- 4. Ler IMU ---
         esp_err_t imu_ret = mpu6050_read_raw_data(&robot_data.imu);
         if (imu_ret != ESP_OK) {
             ESP_LOGW(TAG, "OdomUDP: Falha ao ler dados do MPU-6050. Enviando pacote sem dados IMU atualizados.");
             // Os dados IMU antigos (ou lixo inicial) serão enviados, mas o loop continua
         }
 
-        // --- 3. Enviar Pacote Combinado ---
+        // --- 5. Enviar Pacote Combinado ---
         int err = sendto(g_odom_udp_socket, &robot_data, sizeof(robot_data_t), 0,
                          (struct sockaddr *)&g_ros_client_addr, sizeof(g_ros_client_addr));
         
